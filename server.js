@@ -5,6 +5,19 @@ import fetch from 'node-fetch'
 const app = express()
 const PORT = process.env.PORT || 3001
 
+// ── In-memory price cache (5 min TTL) ────────────────────────────────────────
+const priceCache = new Map() // key → { data, ts }
+const CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+
+function getCached(key) {
+  const entry = priceCache.get(key)
+  if (entry && Date.now() - entry.ts < CACHE_TTL) return entry.data
+  return null
+}
+function setCache(key, data) {
+  priceCache.set(key, { data, ts: Date.now() })
+}
+
 // ── CORS ─────────────────────────────────────────────────────────────────────
 app.use(cors({
   origin: [
@@ -29,6 +42,13 @@ app.get('/api/price', async (req, res) => {
   const { symbol } = req.query
   if (!symbol) return res.status(400).json({ error: 'symbol required' })
 
+  const cacheKey = `stock:${symbol.toUpperCase()}`
+  const cached = getCached(cacheKey)
+  if (cached) {
+    console.log(`[/api/price] Cache hit for ${symbol}`)
+    return res.json({ ...cached, fromCache: true })
+  }
+
   try {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`
     const response = await fetch(url, {
@@ -39,6 +59,10 @@ app.get('/api/price', async (req, res) => {
     })
 
     if (!response.ok) {
+      console.error(`[/api/price] Yahoo returned ${response.status} for ${symbol}`)
+      // Return cached stale data if available
+      const stale = priceCache.get(cacheKey)
+      if (stale) return res.json({ ...stale.data, fromCache: true, stale: true })
       return res.status(502).json({ error: `Yahoo Finance returned ${response.status}` })
     }
 
@@ -53,21 +77,23 @@ app.get('/api/price', async (req, res) => {
     const currency = meta.currency || 'USD'
     const change = meta.regularMarketChangePercent || 0
 
-    // Convert to CHF if needed (simplified: USD → CHF via a fixed approximation)
-    // For production: use a real FX API
-    const usdChfRate = 0.91 // Approximate — update if needed
+    const usdChfRate = 0.91
     const priceChf = currency === 'CHF' ? price : price * usdChfRate
 
-    res.json({
+    const payload = {
       symbol: symbol.toUpperCase(),
       price: Math.round(priceChf * 100) / 100,
       priceOriginal: price,
       currency,
       changePercent: Math.round(change * 100) / 100,
       timestamp: Date.now(),
-    })
+    }
+    setCache(cacheKey, payload)
+    res.json(payload)
   } catch (err) {
     console.error(`[/api/price] Error for ${symbol}:`, err.message)
+    const stale = priceCache.get(cacheKey)
+    if (stale) return res.json({ ...stale.data, fromCache: true, stale: true })
     res.status(500).json({ error: 'Failed to fetch stock price', details: err.message })
   }
 })
@@ -78,16 +104,35 @@ app.get('/api/crypto', async (req, res) => {
   const { id } = req.query
   if (!id) return res.status(400).json({ error: 'id required (CoinGecko ID, e.g. bitcoin)' })
 
+  const cacheKey = `crypto:${id}`
+  const cached = getCached(cacheKey)
+  if (cached) {
+    console.log(`[/api/crypto] Cache hit for ${id}`)
+    return res.json({ ...cached, fromCache: true })
+  }
+
+  const apiKey = process.env.COINGECKO_API_KEY || ''
+  // API key can be sent as header OR query param — use both for reliability
+  const keyParam = apiKey ? `&x_cg_demo_api_key=${encodeURIComponent(apiKey)}` : ''
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=chf&include_24hr_change=true${keyParam}`
+
   try {
-    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=chf&include_24hr_change=true`
     const response = await fetch(url, {
       headers: {
         'Accept': 'application/json',
-        'x-cg-demo-api-key': process.env.COINGECKO_API_KEY || '',
+        ...(apiKey ? { 'x-cg-demo-api-key': apiKey } : {}),
       },
     })
 
+    console.log(`[/api/crypto] CoinGecko status ${response.status} for ${id}`)
+
     if (!response.ok) {
+      // Return stale cache on error rather than 502
+      const stale = priceCache.get(cacheKey)
+      if (stale) {
+        console.log(`[/api/crypto] Using stale cache for ${id}`)
+        return res.json({ ...stale.data, fromCache: true, stale: true })
+      }
       return res.status(502).json({ error: `CoinGecko returned ${response.status}` })
     }
 
@@ -100,15 +145,19 @@ app.get('/api/crypto', async (req, res) => {
     const price = data[id].chf
     const change = data[id].chf_24h_change
 
-    res.json({
+    const payload = {
       id,
       price: Math.round(price * 100) / 100,
       currency: 'CHF',
-      change24h: Math.round(change * 100) / 100,
+      change24h: Math.round((change || 0) * 100) / 100,
       timestamp: Date.now(),
-    })
+    }
+    setCache(cacheKey, payload)
+    res.json(payload)
   } catch (err) {
     console.error(`[/api/crypto] Error for ${id}:`, err.message)
+    const stale = priceCache.get(cacheKey)
+    if (stale) return res.json({ ...stale.data, fromCache: true, stale: true })
     res.status(500).json({ error: 'Failed to fetch crypto price', details: err.message })
   }
 })
@@ -123,57 +172,7 @@ app.get('/api/prices', async (req, res) => {
   // Batch crypto
   if (cryptos.length > 0) {
     try {
+      const apiKey = process.env.COINGECKO_API_KEY || ''
+      const keyParam = apiKey ? `&x_cg_demo_api_key=${encodeURIComponent(apiKey)}` : ''
       const ids = cryptos.join(',')
-      const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(ids)}&vs_currencies=chf&include_24hr_change=true`
-      const response = await fetch(url, {
-        headers: { 'Accept': 'application/json' },
-      })
-      if (response.ok) {
-        const data = await response.json()
-        Object.entries(data).forEach(([id, vals]) => {
-          result[id.toUpperCase()] = {
-            price: Math.round(vals.chf * 100) / 100,
-            change24h: Math.round((vals.chf_24h_change || 0) * 100) / 100,
-          }
-        })
-      }
-    } catch (err) {
-      console.error('[/api/prices] Crypto batch error:', err.message)
-    }
-  }
-
-  // Individual stocks (Yahoo doesn't support batch easily)
-  for (const symbol of stocks) {
-    try {
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`
-      const response = await fetch(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-      })
-      if (response.ok) {
-        const data = await response.json()
-        const meta = data?.chart?.result?.[0]?.meta
-        if (meta) {
-          const price = meta.regularMarketPrice || meta.previousClose
-          const currency = meta.currency || 'USD'
-          const usdChfRate = 0.91
-          result[symbol.toUpperCase()] = {
-            price: Math.round((currency === 'CHF' ? price : price * usdChfRate) * 100) / 100,
-            change24h: Math.round((meta.regularMarketChangePercent || 0) * 100) / 100,
-          }
-        }
-      }
-    } catch (err) {
-      console.error(`[/api/prices] Stock error for ${symbol}:`, err.message)
-    }
-  }
-
-  res.json({ prices: result, timestamp: Date.now() })
-})
-
-// ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🚀 Wealth Backend running on port ${PORT}`)
-  console.log(`   Stock prices: /api/price?symbol=AAPL`)
-  console.log(`   Crypto prices: /api/crypto?id=bitcoin`)
-  console.log(`   Batch: /api/prices?stocks=AAPL,VWRL&cryptos=bitcoin`)
-})
+      const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(ids)}&vs_currencies=chf&include_24hr_change=true${keyParam}
