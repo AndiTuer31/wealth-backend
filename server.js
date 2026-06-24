@@ -10,6 +10,32 @@ const PORT = process.env.PORT || 3001
 const priceCache = new Map() // key → { data, ts }
 const CACHE_TTL = 5 * 60 * 1000 // 5 minutes
 
+// ── Live USD→CHF rate cache (1 hour TTL) ─────────────────────────────────────
+let fxCache = null
+const FX_TTL = 60 * 60 * 1000 // 1 hour
+
+async function getLiveUsdChf() {
+  if (fxCache && Date.now() - fxCache.ts < FX_TTL) return fxCache.rate
+  try {
+    const url = 'https://query1.finance.yahoo.com/v8/finance/chart/USDCHF=X?interval=1d&range=1d'
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+    })
+    if (res.ok) {
+      const data = await res.json()
+      const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice
+      if (price) {
+        fxCache = { rate: price, ts: Date.now() }
+        console.log(`[FX] USDCHF live rate: ${price}`)
+        return price
+      }
+    }
+  } catch (err) {
+    console.warn('[FX] Failed to fetch USDCHF:', err.message)
+  }
+  return fxCache?.rate || 0.90 // fallback to last known or 0.90
+}
+
 function getCached(key) {
   const entry = priceCache.get(key)
   if (entry && Date.now() - entry.ts < CACHE_TTL) return entry.data
@@ -78,7 +104,7 @@ app.get('/api/price', async (req, res) => {
     const currency = meta.currency || 'USD'
     const change = meta.regularMarketChangePercent || 0
 
-    const usdChfRate = 0.91
+    const usdChfRate = await getLiveUsdChf()
     const priceChf = currency === 'CHF' ? price : price * usdChfRate
 
     const payload = {
@@ -163,6 +189,12 @@ app.get('/api/crypto', async (req, res) => {
   }
 })
 
+// ── GET /api/fx — Live exchange rate ─────────────────────────────────────────
+app.get('/api/fx', async (req, res) => {
+  const rate = await getLiveUsdChf()
+  res.json({ pair: 'USDCHF', rate, timestamp: Date.now() })
+})
+
 // ── GET /api/prices — Batch prices ───────────────────────────────────────────
 // ?stocks=AAPL,VWRL&cryptos=bitcoin,ethereum
 app.get('/api/prices', async (req, res) => {
@@ -210,7 +242,7 @@ app.get('/api/prices', async (req, res) => {
         if (meta) {
           const price = meta.regularMarketPrice || meta.previousClose
           const currency = meta.currency || 'USD'
-          const usdChfRate = 0.91
+          const usdChfRate = await getLiveUsdChf()
           result[symbol.toUpperCase()] = {
             price: Math.round((currency === 'CHF' ? price : price * usdChfRate) * 100) / 100,
             change24h: Math.round((meta.regularMarketChangePercent || 0) * 100) / 100,
