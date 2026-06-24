@@ -1,7 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import fetch from 'node-fetch'
-import Anthropic from '@anthropic-ai/sdk'
+// Anthropic SDK replaced by direct fetch (Node 26 compatibility)
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -283,17 +283,30 @@ AKTUELLER PORTFOLIO-STAND:`
   systemPrompt += `\n\nBeantworte Fragen zu diesem Portfolio präzise und hilfreich. Wenn du konkrete Zahlen nennst, beziehe dich auf die obigen Daten.`
 
   try {
-    const anthropic = new Anthropic({ apiKey, timeout: 60000 })
-
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 512,
-      system: systemPrompt,
-      messages: messages.slice(-6),
+    const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 512,
+        system: systemPrompt,
+        messages: messages.slice(-6),
+      }),
     })
 
-    const reply = response.content[0]?.text || ''
-    res.json({ reply, usage: response.usage })
+    if (!anthropicRes.ok) {
+      const errText = await anthropicRes.text()
+      console.error(`[/api/chat] Anthropic HTTP ${anthropicRes.status}:`, errText)
+      return res.status(502).json({ error: `Anthropic returned ${anthropicRes.status}`, details: errText })
+    }
+
+    const data = await anthropicRes.json()
+    const reply = data.content?.[0]?.text || ''
+    res.json({ reply, usage: data.usage })
   } catch (err) {
     console.error('[/api/chat] Anthropic error:', err.message)
     res.status(500).json({ error: 'Chat request failed', details: err.message })
