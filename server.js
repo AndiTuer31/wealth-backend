@@ -10,14 +10,20 @@ const PORT = process.env.PORT || 3001
 const priceCache = new Map() // key → { data, ts }
 const CACHE_TTL = 5 * 60 * 1000 // 5 minutes
 
-// ── Live USD→CHF rate cache (1 hour TTL) ─────────────────────────────────────
-let fxCache = null
+// ── Multi-currency FX cache (1 hour TTL) ─────────────────────────────────────
+const fxStore = {} // { 'USDCHF': { rate, ts }, 'HKDCHF': { rate, ts }, ... }
 const FX_TTL = 60 * 60 * 1000 // 1 hour
 
-async function getLiveUsdChf() {
-  if (fxCache && Date.now() - fxCache.ts < FX_TTL) return fxCache.rate
+// Fallback rates when Yahoo is unavailable
+const FX_FALLBACK = { USDCHF: 0.90, HKDCHF: 0.114, EURUSD: 1.08, GBPCHF: 1.13 }
+
+async function getRateToChf(currency) {
+  if (currency === 'CHF') return 1
+  const pair = `${currency}CHF`
+  const cached = fxStore[pair]
+  if (cached && Date.now() - cached.ts < FX_TTL) return cached.rate
   try {
-    const url = 'https://query1.finance.yahoo.com/v8/finance/chart/USDCHF=X?interval=1d&range=1d'
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${pair}=X?interval=1d&range=1d`
     const res = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
     })
@@ -25,16 +31,19 @@ async function getLiveUsdChf() {
       const data = await res.json()
       const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice
       if (price) {
-        fxCache = { rate: price, ts: Date.now() }
-        console.log(`[FX] USDCHF live rate: ${price}`)
+        fxStore[pair] = { rate: price, ts: Date.now() }
+        console.log(`[FX] ${pair} live rate: ${price}`)
         return price
       }
     }
   } catch (err) {
-    console.warn('[FX] Failed to fetch USDCHF:', err.message)
+    console.warn(`[FX] Failed to fetch ${pair}:`, err.message)
   }
-  return fxCache?.rate || 0.90 // fallback to last known or 0.90
+  return fxStore[pair]?.rate || FX_FALLBACK[pair] || 1
 }
+
+// Convenience alias used by /api/fx endpoint
+async function getLiveUsdChf() { return getRateToChf('USD') }
 
 function getCached(key) {
   const entry = priceCache.get(key)
@@ -104,8 +113,8 @@ app.get('/api/price', async (req, res) => {
     const currency = meta.currency || 'USD'
     const change = meta.regularMarketChangePercent || 0
 
-    const usdChfRate = await getLiveUsdChf()
-    const priceChf = currency === 'CHF' ? price : price * usdChfRate
+    const rate = await getRateToChf(currency)
+    const priceChf = price * rate
 
     const payload = {
       symbol: symbol.toUpperCase(),
@@ -242,9 +251,9 @@ app.get('/api/prices', async (req, res) => {
         if (meta) {
           const price = meta.regularMarketPrice || meta.previousClose
           const currency = meta.currency || 'USD'
-          const usdChfRate = await getLiveUsdChf()
+          const rate = await getRateToChf(currency)
           result[symbol.toUpperCase()] = {
-            price: Math.round((currency === 'CHF' ? price : price * usdChfRate) * 100) / 100,
+            price: Math.round(price * rate * 100) / 100,
             change24h: Math.round((meta.regularMarketChangePercent || 0) * 100) / 100,
           }
         }
