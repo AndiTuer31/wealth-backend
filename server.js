@@ -283,13 +283,13 @@ AKTUELLER PORTFOLIO-STAND:`
   systemPrompt += `\n\nBeantworte Fragen zu diesem Portfolio präzise und hilfreich. Wenn du konkrete Zahlen nennst, beziehe dich auf die obigen Daten.`
 
   try {
-    const anthropic = new Anthropic({ apiKey })
+    const anthropic = new Anthropic({ apiKey, timeout: 60000 })
 
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1024,
+      max_tokens: 512,
       system: systemPrompt,
-      messages: messages.slice(-10), // Last 10 messages for context window
+      messages: messages.slice(-6),
     })
 
     const reply = response.content[0]?.text || ''
